@@ -28,10 +28,30 @@ Users install through **Extensions: Install Extension from Git Link**. The host
 clones HTTPS or SSH links using Git's existing credentials, copies tracked files,
 validates every package, and records the commit in `.vtcode-source.json`.
 Repositories may contain a single package or a collection. `#path=folder&ref=tag`
-selects a package and branch/tag; GitHub, GitLab and Codeberg browser tree links
+selects a package and preselects a branch/tag; GitHub, GitLab and Codeberg browser tree links
 are also recognized. Use fragments for branch names containing `/`.
 
-Pasting the same source link updates installed packages. A different repository
+The installer lists remote Git tags and branches before downloading a package.
+Semantic release tags such as `v1.2.0` are ordered by version with the latest
+stable release recommended; prereleases, other tags, and development branches
+are labeled separately. The installed version and selected commit are shown.
+Choosing an older tag deliberately downgrades the package. There are no
+automatic updates. A repository without tags offers development branches.
+
+Each selection is pinned to the advertised commit. Annotated tags are resolved
+to their underlying commits, and full refs distinguish a tag from a branch
+with the same name. If a ref changes between selection and download, the host
+refuses the installation and asks the user to refresh. `.vtcode-source.json`
+records `version`, `reference`, `referenceKind`, and `commit`; older provenance
+files without `referenceKind` remain readable.
+
+For a single package, a semantic version tag must match `extension.json`'s
+version. Commit source and prebuilt Wasm before tagging, then push the tag to
+publish that version. `apiVersion` remains independent of the package version.
+Do not force-update published version tags: replacing an already installed tag
+with a different commit is refused. Publish a new version for corrections.
+
+Pasting the same source link lets users change installed versions. A different repository
 cannot replace the same extension ID. Installation is staged, preserves the
 previous version on validation failure, and rolls back a failed publication.
 Downloaded build scripts and Git hooks are never run. Packages cannot contain

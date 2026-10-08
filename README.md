@@ -60,7 +60,7 @@ also protected. Keep sufficient free disk space for saves and recovery copies.
 
 ## Build
 
-Requires Git, Python 3, and the Rust version declared by this project (1.98 or
+Requires Git, Python 3.11 or newer, and the Rust version declared by this project (1.98 or
 newer). Run from this directory:
 
 ```sh
@@ -83,9 +83,46 @@ and press Enter:
 https://github.com/im-henri/vtcode-ext-hex-editor.git
 ```
 
-Use the same link to update. Append `#ref=tag-or-branch` to select a version.
+VTCode shows a version picker before downloading the package. Stable release
+tags such as `v0.1.0` appear first, followed by prereleases, other tags, and
+development branches. The newest stable release is recommended; the installed
+version is shown so you can update or return to an older release.
+
+Use the same link to change versions. Append `#ref=tag-or-branch` to preselect a
+specific entry. Each installation records the chosen tag or branch and exact
+commit. There are no automatic updates. Branch snapshots can change; published
+version tags must remain fixed.
+
 Installation downloads the committed source and prebuilt Wasm; it does not run
-build scripts. New commits become installable after they are pushed to GitHub.
+build scripts. A repository with no tags offers its development branches until
+the author publishes a version tag.
+
+## Publish versions
+
+The extension version in `extension.json`, the Cargo package version, and the
+Git tag describe the same release. `apiVersion` describes host compatibility
+and is independent of the extension version.
+
+For a new version, run:
+
+```sh
+python build.py --version 0.1.1
+git add -A
+git commit -m "Release 0.1.1"
+git tag -a v0.1.1 -m "Hex Editor 0.1.1"
+git push origin main
+git push origin v0.1.1
+```
+
+`--version` synchronizes the manifest, Cargo.toml, and Cargo.lock, then runs
+tests and rebuilds the Wasm module. Commit all source changes and the rebuilt
+module before tagging. CI rejects mismatched package versions or release tags.
+For a prerelease, use a version such as `0.2.0-beta.1` and tag `v0.2.0-beta.1`.
+
+For the initial `0.1.0` release, tag its existing committed implementation as
+`v0.1.0` and push that tag. The version becomes visible to VTCode once the tag
+is pushed; a GitHub Release page is optional. Never move or force-update a
+published version tag. Publish a new patch version for corrections.
 
 ## Repository layout
 
