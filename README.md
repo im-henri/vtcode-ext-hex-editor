@@ -76,7 +76,7 @@ Wasm together.
 ## Install from Git
 
 Requires a VTCode build with extension API version 2 and the Git extension
-installer. Run **Extensions: Install Extension from Git Link**, paste this link,
+installer. Run **Extensions: Install Extension from GitHub**, paste this link,
 and press Enter:
 
 ```text
@@ -84,7 +84,7 @@ https://github.com/im-henri/vtcode-ext-hex-editor.git
 ```
 
 VTCode shows a version picker before downloading the package. Stable release
-tags such as `v0.1.0` appear first, followed by prereleases, other tags, and
+tags such as `v0.2.0` appear first, followed by prereleases, other tags, and
 development branches. The newest stable release is recommended; the installed
 version is shown so you can update or return to an older release.
 
@@ -120,7 +120,7 @@ module before tagging. CI rejects mismatched package versions or release tags.
 For a prerelease, use a version such as `0.2.0-beta.1` and tag `v0.2.0-beta.1`.
 
 For the initial `0.1.0` release, tag its existing committed implementation as
-`v0.1.0` and push that tag. The version becomes visible to VTCode once the tag
+`v0.2.0` and push that tag. The version becomes visible to VTCode once the tag
 is pushed; a GitHub Release page is optional. Never move or force-update a
 published version tag. Publish a new patch version for corrections.
 
@@ -137,3 +137,26 @@ Linux. Real-Wasm workbench integration tests live in the
 
 MIT; see `LICENSE`. This is a VTCode extension implemented in Rust, inspired by
 the Microsoft extension's interaction model.
+
+## Publish a VTCode release
+
+Keep `extension.json`, `Cargo.toml`, and `Cargo.lock` versions identical. Build
+and test the extension, then run:
+
+```sh
+python package.py --tag v0.2.0 --output dist/vtcode-extension.zip
+```
+
+`package-files.json` explicitly lists the manifest, prebuilt Wasm, documentation,
+and license notices needed in the runtime package. Source trees, Git metadata,
+build scripts, and unlisted files are excluded. Add runtime assets to this list
+when needed. ZIP creation is reproducible and streams files in bounded chunks.
+
+Create and push the matching version tag. The Release workflow builds and tests
+the extension and attaches `vtcode-extension.zip` to its GitHub release. A tag
+without this package is not installable in VTCode. Existing published packages
+are never overwritten: publish a new version for corrections.
+
+Private GitHub releases use your existing `gh auth login` sign-in, or
+`GH_TOKEN` / `GITHUB_TOKEN`. VTCode retrieves release metadata and the runtime
+ZIP directly; it never clones the repository to install an extension.
