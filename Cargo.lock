@@ -110,6 +110,7 @@ dependencies = [
 name = "vtcode-hex-editor"
 version = "0.2.0"
 dependencies = [
+ "memchr",
  "serde",
  "serde_json",
  "unicode-width",

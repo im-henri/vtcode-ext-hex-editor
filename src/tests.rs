@@ -251,7 +251,7 @@ fn searches_cross_chunk_boundaries_wrap_backward_and_cancel() {
         memory
             .reads
             .iter()
-            .all(|(_, count)| *count <= 64 * 1024 + 4095)
+            .all(|(_, count)| *count <= crate::search::CHUNK + 4095)
     );
 }
 
@@ -316,12 +316,12 @@ fn responsive_frames_stay_inside_the_surface_and_inspect_endianness() {
     assert!(
         crate::render::inspect(&[1, 2, 3, 4], true)
             .iter()
-            .any(|line| line.contains("UInt16") && line.contains("513"))
+            .any(|(label, value)| *label == "UInt16" && value == "513")
     );
     assert!(
         crate::render::inspect(&[1, 2, 3, 4], false)
             .iter()
-            .any(|line| line.contains("UInt16") && line.contains("258"))
+            .any(|(label, value)| *label == "UInt16" && value == "258")
     );
 }
 
@@ -358,6 +358,27 @@ fn clicking_and_dragging_select_synchronized_bytes() {
         &mut memory,
     );
     assert!(!editor.dragging);
+    // Shift+click keeps both the selection start and the clicked byte.
+    editor.event(
+        Event {
+            kind: "down".into(),
+            view_column: layout.hex_start as u16,
+            view_row: layout.data_start as u16,
+            ..Default::default()
+        },
+        &mut memory,
+    );
+    editor.event(
+        Event {
+            kind: "down".into(),
+            shift: true,
+            view_column: layout.hex_x(1) as u16,
+            view_row: (layout.data_start + 1) as u16,
+            ..Default::default()
+        },
+        &mut memory,
+    );
+    assert_eq!(editor.selection(100), (0, 18));
 }
 
 #[test]
@@ -486,4 +507,114 @@ fn edits_are_highlighted_in_both_panes_until_saved() {
             .flatten()
             .any(|span| span.role == "changed")
     );
+}
+
+#[test]
+fn searches_and_replacements_straddle_large_read_chunks() {
+    let chunk = crate::search::CHUNK;
+    let mut bytes = vec![b'.'; chunk * 2 + 1000];
+    for at in [chunk - 2, chunk * 2 - 1] {
+        bytes[at..at + 4].copy_from_slice(b"seam");
+    }
+    let mut memory = Memory::new(bytes.clone());
+    let mut editor = HexEditor::new(1);
+    let find = |editor: &mut HexEditor, memory: &mut Memory, shift: bool| {
+        editor.prompt = Some(Prompt::Find {
+            query: "seam".into(),
+            replacement: String::new(),
+            hex: false,
+            replace: false,
+            field: 0,
+        });
+        editor.event(
+            Event {
+                code: "enter".into(),
+                shift,
+                ..Default::default()
+            },
+            memory,
+        );
+        while editor.search.is_some() {
+            editor.search_step(memory).unwrap();
+        }
+        editor.cursor
+    };
+    assert_eq!(find(&mut editor, &mut memory, false), (chunk - 2) as u64);
+    assert_eq!(
+        find(&mut editor, &mut memory, false),
+        (chunk * 2 - 1) as u64
+    );
+    assert_eq!(find(&mut editor, &mut memory, true), (chunk - 2) as u64);
+    editor.prompt = Some(Prompt::Find {
+        query: "seam".into(),
+        replacement: "joined!".into(),
+        hex: false,
+        replace: true,
+        field: 0,
+    });
+    editor.event(
+        Event {
+            code: "enter".into(),
+            control: true,
+            shift: true,
+            ..Default::default()
+        },
+        &mut memory,
+    );
+    while editor.search.is_some() {
+        editor.search_step(&mut memory).unwrap();
+    }
+    let expected = String::from_utf8(bytes)
+        .unwrap()
+        .replace("seam", "joined!")
+        .into_bytes();
+    assert_eq!(memory.bytes, expected);
+    assert!(
+        editor.status.contains("Replaced 2 matches"),
+        "{}",
+        editor.status
+    );
+}
+
+#[test]
+fn scrollbar_drags_cover_the_whole_file_and_wheel_pages_with_shift() {
+    let mut memory = Memory::new(vec![7; 1 << 20]);
+    let mut editor = HexEditor::new(1);
+    editor.width = 100;
+    editor.height = 30;
+    editor.inspector = false;
+    editor.render(&mut memory).unwrap();
+    let layout = editor.layout(1 << 20);
+    let (thumb, _) = editor.thumb(1 << 20, &layout).unwrap();
+    assert_eq!(thumb, 0);
+    let x = layout.scrollbar as u16;
+    let pointer = |editor: &mut HexEditor, memory: &mut Memory, kind: &str, y: usize| {
+        editor.event(
+            Event {
+                kind: kind.into(),
+                view_column: x,
+                view_row: y as u16,
+                ..Default::default()
+            },
+            memory,
+        );
+        editor.render(memory).unwrap();
+    };
+    pointer(&mut editor, &mut memory, "down", layout.data_start);
+    pointer(&mut editor, &mut memory, "drag", layout.data_start + 200);
+    assert_eq!(editor.top, HexEditor::max_top(1 << 20, &layout));
+    pointer(&mut editor, &mut memory, "drag", 0);
+    assert_eq!(editor.top, 0);
+    pointer(&mut editor, &mut memory, "up", 0);
+    assert!(editor.scroll_grab.is_none());
+    editor.event(
+        Event {
+            direction: 1,
+            shift: true,
+            ..Default::default()
+        },
+        &mut memory,
+    );
+    assert_eq!(editor.top, ((layout.rows - 1) * layout.bpr) as u64);
+    assert_eq!(editor.cursor, 0, "scrolling leaves the cursor in place");
 }

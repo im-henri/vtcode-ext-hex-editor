@@ -32,13 +32,22 @@ Save unsaved text changes first if the same file is open in a text tab.
 | Alt+I / Alt+E | Toggle inspector / endianness |
 | Escape | Cancel a search or replacement, or close the form |
 
+The toolbar has Save, Undo, Redo, Find and Go to buttons, plus switches for
+overwrite/insert mode and the inspector; the inspector header switches between
+little- and big-endian. The find bar has Text/Hex, Previous/Next and Replace
+buttons, and clicking a field places the caret. Drag the scrollbar (or click
+its track) to jump anywhere in a large file; the mouse wheel scrolls three rows,
+and Shift or Ctrl with the wheel scrolls a page. Double-click selects a row, and
+dragging past the top or bottom of the grid keeps extending the selection.
+
 Hex paste accepts pairs such as `CA FE BA BE`, `cafebabe`, or `0xCA_0xFE`.
 Decoded text displays printable ASCII; typing and text search use UTF-8 bytes.
 The inspector decodes signed and unsigned integers, floats, bits, UTF-8, and
 UTF-16 in the selected endianness. An empty file supports insertion at offset 0.
 
-The two nibbles of a byte form one undo step. Replace All runs in bounded chunks
-and forms one undo step; Escape rolls back the whole replacement. Inserted
+The two nibbles of a byte form one undo step. Search and Replace All scan 1 MiB at a time with
+SIMD matching, running in the background between frames; Replace All forms one
+undo step; Escape rolls back the whole replacement. Inserted
 replacement bytes are never searched again during the same operation.
 
 ## Save and recovery

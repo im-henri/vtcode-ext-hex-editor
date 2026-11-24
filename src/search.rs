@@ -1,9 +1,14 @@
 use crate::editor::{Backend, Event, HexEditor, Prompt, parse_hex};
+use memchr::memmem;
 use vtcode_extension_api::editor::DocumentInfo;
+
+/// Bytes scanned per read. The host allows reads of up to 1 MiB.
+pub const CHUNK: usize = 1024 * 1024 - 8192;
+/// Replacement output flushed per edit, well under the 1 MiB edit limit.
+const FLUSH: usize = 512 * 1024;
 
 pub struct SearchTask {
     needle: Vec<u8>,
-    prefix: Vec<usize>,
     ranges: std::collections::VecDeque<(u64, u64)>,
     backward: bool,
     size: u64,
@@ -14,17 +19,6 @@ pub struct SearchTask {
 
 impl SearchTask {
     fn new(needle: Vec<u8>, start: u64, size: u64, backward: bool) -> Self {
-        let mut prefix = vec![0; needle.len()];
-        for i in 1..needle.len() {
-            let mut matched = prefix[i - 1];
-            while matched > 0 && needle[matched] != needle[i] {
-                matched = prefix[matched - 1];
-            }
-            if needle[matched] == needle[i] {
-                matched += 1;
-            }
-            prefix[i] = matched;
-        }
         let ranges = if backward {
             [(0, start), (start, size)]
         } else {
@@ -32,7 +26,6 @@ impl SearchTask {
         };
         Self {
             needle,
-            prefix,
             ranges: ranges.into(),
             backward,
             size,
@@ -42,11 +35,23 @@ impl SearchTask {
         }
     }
 
+    pub fn progress(&self) -> u64 {
+        self.scanned
+            .saturating_mul(100)
+            .checked_div(self.size)
+            .unwrap_or(100)
+            .min(100)
+    }
+
+    pub fn replacing(&self) -> bool {
+        self.replacement.is_some()
+    }
+
     fn replace_step(&mut self, backend: &mut impl Backend, document: u32) -> Result<bool, String> {
         let Some(&(start, end)) = self.ranges.front() else {
             return Ok(true);
         };
-        let count = (end - start).min(64 * 1024) as usize;
+        let count = (end - start).min(CHUNK as u64) as usize;
         if count == 0 {
             self.ranges.clear();
             return Ok(true);
@@ -58,47 +63,39 @@ impl SearchTask {
         )?;
         let replacement = self.replacement.as_ref().ok_or("Missing replacement")?;
         let mut output = Vec::new();
-        let mut matched = 0;
         let mut copied = 0;
         let mut consumed = count;
         let mut matches = 0;
-        for (index, byte) in bytes.iter().enumerate() {
-            while matched > 0 && self.needle[matched] != *byte {
-                matched = self.prefix[matched - 1];
+        // Matches never overlap, and inserted bytes are never searched again.
+        for found in memmem::find_iter(&bytes, &self.needle) {
+            if found >= count {
+                break;
             }
-            if self.needle[matched] == *byte {
-                matched += 1;
-            }
-            if matched == self.needle.len() {
-                let found = index + 1 - matched;
-                if found >= count {
-                    break;
-                }
-                output.extend_from_slice(&bytes[copied..found]);
-                output.extend_from_slice(replacement);
-                copied = index + 1;
-                consumed = consumed.max(copied);
-                matched = 0; // Replacement matches never overlap or scan inserted bytes.
-                matches += 1;
-                if output.len() >= 64 * 1024 {
-                    consumed = copied;
-                    break;
-                }
+            output.extend_from_slice(&bytes[copied..found]);
+            output.extend_from_slice(replacement);
+            copied = found + self.needle.len();
+            consumed = consumed.max(copied);
+            matches += 1;
+            if output.len() >= FLUSH {
+                consumed = copied;
+                break;
             }
         }
-        let inserted = if matches > 0 {
-            output.extend_from_slice(&bytes[copied..consumed]);
-            backend.edit(document, start, consumed as u64, &output)?;
-            output.len() as u64
+        // Replace only through the last match; the unchanged tail is skipped.
+        let (next, end) = if matches > 0 {
+            backend.edit(document, start, copied as u64, &output)?;
+            let inserted = output.len() as u64;
+            (
+                start + inserted + (consumed - copied) as u64,
+                end - copied as u64 + inserted,
+            )
         } else {
-            consumed as u64
+            (start + consumed as u64, end)
         };
         self.replaced += matches;
         self.scanned += consumed as u64;
-        let end = end - consumed as u64 + inserted;
-        let next = start + inserted;
         self.ranges[0] = (next, end);
-        if next == end {
+        if next >= end {
             self.ranges.clear();
         }
         Ok(self.ranges.is_empty())
@@ -109,35 +106,23 @@ impl SearchTask {
             return Ok(None);
         };
         let (begin, limit) = if self.backward {
-            (end.saturating_sub(64 * 1024).max(*start), *end)
+            (end.saturating_sub(CHUNK as u64).max(*start), *end)
         } else {
-            (*start, start.saturating_add(64 * 1024).min(*end))
+            (*start, start.saturating_add(CHUNK as u64).min(*end))
         };
         let count = (limit
             .saturating_add(self.needle.len() as u64 - 1)
             .min(self.size)
             - begin) as usize;
         let bytes = backend.read(document, begin, count)?;
-        let mut matched = 0;
-        let mut found = None;
-        for (index, byte) in bytes.iter().enumerate() {
-            while matched > 0 && self.needle[matched] != *byte {
-                matched = self.prefix[matched - 1];
-            }
-            if self.needle[matched] == *byte {
-                matched += 1;
-            }
-            if matched == self.needle.len() {
-                let offset = begin + (index + 1 - matched) as u64;
-                if offset < limit {
-                    found = Some(offset);
-                    if !self.backward {
-                        break;
-                    }
-                }
-                matched = self.prefix[matched - 1];
-            }
+        // The window ends needle-1 bytes past the limit, so every match in it
+        // starts before the limit.
+        let found = if self.backward {
+            memmem::rfind(&bytes, &self.needle)
+        } else {
+            memmem::find(&bytes, &self.needle)
         }
+        .map(|index| begin + index as u64);
         self.scanned += limit - begin;
         if self.backward {
             *end = begin;
@@ -405,6 +390,16 @@ impl HexEditor {
     }
 
     pub fn search_step(&mut self, backend: &mut impl Backend) -> Result<(), String> {
+        // Work in chunks until a match, the end, or the host asks us to yield.
+        loop {
+            self.search_chunk(backend)?;
+            if self.search.is_none() || backend.should_yield() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn search_chunk(&mut self, backend: &mut impl Backend) -> Result<(), String> {
         let Some(task) = self.search.as_mut() else {
             return Ok(());
         };
@@ -421,7 +416,8 @@ impl HexEditor {
                 let count = task.replaced;
                 backend.action(self.document, 7)?;
                 self.search = None;
-                self.cursor = self.cursor.min(backend.info(self.document)?.size);
+                self.size = backend.info(self.document)?.size;
+                self.cursor = self.cursor.min(self.size);
                 self.anchor = None;
                 self.status = format!(
                     "Replaced {count} match{} · Ctrl+Z to undo",
@@ -430,10 +426,7 @@ impl HexEditor {
             } else {
                 self.status = format!(
                     "Replacing… {}% · {} matches · Esc cancels all changes",
-                    task.scanned
-                        .saturating_mul(100)
-                        .checked_div(task.size)
-                        .unwrap_or(100),
+                    task.progress(),
                     task.replaced
                 );
             }
@@ -451,13 +444,7 @@ impl HexEditor {
             self.status = "No matches".into();
             self.search = None;
         } else {
-            self.status = format!(
-                "Searching… {}% · Esc to cancel",
-                task.scanned
-                    .saturating_mul(100)
-                    .checked_div(task.size)
-                    .unwrap_or(100)
-            );
+            self.status = format!("Searching… {}% · Esc to cancel", task.progress());
         }
         Ok(())
     }
@@ -472,59 +459,4 @@ impl HexEditor {
         }
         Ok(())
     }
-}
-
-pub fn find_range(
-    backend: &mut impl Backend,
-    id: u32,
-    needle: &[u8],
-    start: u64,
-    end: u64,
-) -> Result<Option<u64>, String> {
-    if needle.is_empty() {
-        return Ok(None);
-    }
-    let mut offset = start;
-    while offset < end {
-        let count = (end - offset).min(64 * 1024 + needle.len() as u64 - 1) as usize;
-        let chunk = backend.read(id, offset, count)?;
-        if let Some(index) = chunk
-            .windows(needle.len())
-            .position(|window| window == needle)
-        {
-            return Ok(Some(offset + index as u64));
-        }
-        if chunk.len() < needle.len() || count <= needle.len() {
-            break;
-        }
-        offset += (chunk.len() - needle.len() + 1) as u64;
-    }
-    Ok(None)
-}
-
-pub fn find_backward(
-    backend: &mut impl Backend,
-    id: u32,
-    needle: &[u8],
-    before: u64,
-    size: u64,
-) -> Result<Option<u64>, String> {
-    for (mut end, floor) in [(before.min(size), 0), (size, before.min(size))] {
-        while end > floor {
-            let start = end.saturating_sub(64 * 1024).max(floor);
-            let count = (end.saturating_add(needle.len() as u64 - 1).min(size) - start) as usize;
-            let chunk = backend.read(id, start, count)?;
-            if let Some(index) = chunk
-                .windows(needle.len())
-                .rposition(|window| window == needle)
-            {
-                let found = start + index as u64;
-                if found < end {
-                    return Ok(Some(found));
-                }
-            }
-            end = start;
-        }
-    }
-    Ok(None)
 }

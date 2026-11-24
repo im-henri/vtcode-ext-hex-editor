@@ -5,6 +5,33 @@ API version `2` adds custom file editors to the existing commands, views,
 overlays, settings, diagnostics, and text-edit APIs. API version `1` remains
 accepted by the host. This SDK exposes `API_VERSION = "2"`.
 
+Locally developed extensions can omit `repository` until their GitHub repository
+exists. A nonempty repository must still be a valid GitHub repository root.
+Release packages always require a repository matching their download source.
+Extension setting writes are serialized across workers and atomically replace the
+settings file. An unreadable or malformed existing file is preserved and saving
+returns an error, allowing the guest to offer an export instead of losing data.
+
+Host calls are available when compiling for `wasm32`. Shared editor data types
+also compile natively, so extension logic can be unit-tested without linking
+the editor's Wasm host imports into a native test executable.
+
+## Page buttons
+
+An optional `buttons` list puts shortcuts to the extension's commands on its
+page in the Extensions tab, so users need not find them in the command palette:
+
+```json
+"buttons": [
+  { "command": "calc.open" },
+  { "command": "calc.reset", "title": "Reset" }
+]
+```
+
+`command` is an id passed to `register_command`; `title` defaults to the title
+registered with it. A button appears only while the extension is loaded and has
+registered that command.
+
 ## Tagged runtime packages
 
 Each extension has a GitHub repository and versioned GitHub releases.
@@ -69,6 +96,11 @@ gh release create v1.2.0 dist/vtcode-extension.zip dist/vtcode-extension.zip.sha
 
 ## File-backed editors
 
+`register_file_open_command(id, title, "vcd,fst")` offers a command for the
+specified extensions in the file-open chooser, for both text and binary files.
+Binary files also offer generic `register_binary_open_command` handlers;
+duplicate extension/command pairs appear once.
+
 Use `editor::open_document()` during a command invoked for a file. The workbench
 authorizes the command's context path or the active file; a guest cannot request
 an arbitrary path. An unsaved text buffer for that file must be saved or
@@ -77,6 +109,11 @@ runtime remains loaded. Opening the same path reuses its document.
 
 `document_info` reports the path, 64-bit size, dirty/read-only state, and history
 availability. `read_document(id, offset, count)` returns up to 1 MiB;
+`read_document_into(id, offset, &mut buffer)` fills reusable storage and returns
+the byte count without allocating a temporary read buffer. Only that prefix is
+valid; buffer contents are unspecified on error. The host validates the whole
+requested memory range before reading directly into it. Sequential reads reuse
+the file position while retaining external-change checks.
 `edit_document(id, offset, deleted, bytes)` replaces a range, preserving undo
 history. An empty replacement deletes bytes; inserting at the end is supported.
 Offsets must fit a nonnegative signed 64-bit integer. `changed_bytes` returns a
@@ -88,6 +125,7 @@ Use the constants in `editor::action` with `document_action`:
 | --- | --- |
 | `UNDO`, `REDO` | Return whether history changed the document |
 | `SAVE` | Stream and atomically replace after external-change checks |
+| `RELOAD` | Reopen disk content, refusing unsaved edits or an active transaction |
 | `AMEND_NEXT_EDIT` | Fold the next edit into the preceding undo step |
 | `BEGIN_TRANSACTION` | Start a group of edits without adding intermediate undo steps |
 | `COMMIT_TRANSACTION` | Publish the group as one undo step |
@@ -107,7 +145,40 @@ forge them. Save failures preserve the open document. Recovery stores the
 current bytes and the command which opened it, then invokes that command at the
 next startup. Recovery does not persist guest state or undo history.
 
+`editor::document_action(id, editor::action::RELOAD)` reopens a file after an
+external writer replaces it. It refuses unsaved edits, active transactions,
+and conflicts with an unsaved text editor. Save and reload return `false` on
+success; undo/redo return whether the document changed.
+
 ## Terminal surfaces and input
+
+The editor::open_text_document(name, text) function opens generated UTF-8 content
+in a new unsaved text buffer. The name is a leaf filename, content is limited to
+32 MiB, and normal Save As, close confirmation, and text recovery apply. This
+does not grant filesystem access. Pending generated buffers share a 32 MiB limit.
+
+The editor::clipboard_limited(max_bytes) function checks the clipboard snapshot
+size before allocating. Capture a clipboard command in its input callback:
+background task invocations have no input clipboard context.
+Use current_view_event_limited(max_bytes) to reject oversized encoded events
+before allocating them. Input callbacks receive proportional decoding fuel,
+capped at the background task budget.
+For paste events, editor::event_text_limited(max_bytes) captures the decoded
+text directly. This avoids unescaping a large JSON string under Wasm task fuel.
+The snapshot is scoped to the current input callback.
+
+An extension which stages document edits in tasks may export
+vtcode_prepare_document_action() -> i32. Before a workbench Save, Save As,
+recovery, or discard operation, the host calls this optional barrier with task
+fuel. Flush previously accepted input and pending edits, then return zero.
+Nonzero results or traps refuse the workbench operation. Ordinary extensions
+need not implement this export.
+
+Use editor::set_input_pending(view_id, true) when accepting input into a guest
+queue. Clear it when the queue and any source transactions settle or cancel.
+The workbench waits before closing a view with staged input, allowing its final
+dirty state to participate in close confirmation. This flag does not alter
+document bytes or dirty state.
 
 Register a normal view and its key/mouse/scroll handlers, then call
 `editor::set_frame(view_id, &frame)`. Frames are structured lines of styled
@@ -115,11 +186,22 @@ spans, with a viewport size, optional title, cursor, and document ID. They use
 theme roles rather than embedded ANSI escape sequences.
 
 Foreground roles: `text`, `muted`, `accent`, `offset`, `changed`, `warning`,
-`error`, `success`, `selection`, `cursor`. Background roles: `panel`, `header`,
-`selection`, `cursor`, `match`. Unknown roles use the editor defaults. Bold and
-underline are supported. The host enforces readable contrast and clips drawing
+`error`, `success`, `selection`, `cursor`, and eight distinguishable plot colors
+`chart1` through `chart8`. Background roles: `panel`, `header`,
+`selection`, `cursor`, `match`, `hover`. Controls use the workbench's own
+colors: `button`, `buttonHover`, `buttonPrimary`, `buttonPrimaryHover` and
+`input` (text on them defaults to the control's foreground; other foreground
+roles still apply). Scrollbars use `scrollbar` for the track and
+`scrollbarThumb`, `scrollbarThumbHover`, `scrollbarThumbActive` for the thumb;
+draw them as spaces. Older hosts render these as the editor background, so keep
+a visible label such as brackets if that matters. Unknown roles use the editor defaults. Bold and
+underline are supported. The host uses the active theme's colors and clips drawing
 to the viewport. Control characters in span text are rejected. Use Unicode
 terminal column widths when computing layout.
+
+Chart colors follow the active theme's `charts.*` palette, with cyan and an
+additional green from its terminal ANSI palette. Selection, search-match, and
+cursor backgrounds also honor their corresponding editor foreground colors.
 
 Register `editor::register_resize_handler` and read JSON through
 `current_view_event()`. All rich-view events include `viewId`:
@@ -131,24 +213,95 @@ Register `editor::register_resize_handler` and read JSON through
   `select_all`, `find_next`, or `find_prev`.
 - Bracketed paste: `code: "paste"`, `text` containing the pasted content.
 - Pointer: `kind: "down" | "up" | "drag"`, absolute `column`/`row`, relative
-  `viewColumn`/`viewRow`, `width`, `height`, and modifier flags.
-- Scroll: `direction` (-1 up, 1 down), `ctrl`, coordinates and viewport size.
+  `viewColumn`/`viewRow`, `width`, `height`, and modifier flags. Mouse payloads also
+  include `button` (`left` or `middle`) and host-generated `clickCount` (1–3 on
+  presses). A repeated press counts only within 400 ms at the same view, viewport,
+  position, button and modifiers; dragging resets the sequence. Treat missing
+  fields as a single left press for compatibility with older hosts.
+- Additional buttons: include `pointerButtons: ["middle"]` in `editor::Frame` to
+  route middle presses, drags and releases to the mouse handler. This is optional:
+  legacy views retain editor middle-button behavior and older hosts ignore the
+  field. Right presses continue to use the context-menu handler.
+- Passive pointer: opt in with `editor::register_hover_handler(view_id, export)`.
+  That handler receives `kind: "move"` inside the view and `kind: "leave"` when
+  the pointer exits, with the same coordinates, size, and modifiers. Relative
+  coordinates on leave may be outside the viewport and saturate at zero for
+  positions above or to its left. Ordinary mouse handlers keep down/up/drag only.
+- Context menus: opt in with `editor::register_context_menu_handler(view_id, export)`.
+  A right press inside a rich view sends `kind: "contextMenu"`, `button: "right"`,
+  absolute and relative coordinates, viewport size, and modifier flags. The view
+  owns rendering and dismissing its menu; this event does not begin pointer
+  capture. Without this registration, right-click keeps its workbench behavior.
+- Pointer capture: opt in with `editor::enable_pointer_capture(view_id, true)`
+  for a rich view. A left press, or an opted-in middle press, captures drags and
+  release, including outside its bounds. Mouse payloads include `pointerInside`;
+  outside coordinates saturate at zero above/left. A `kind: "cancel"` mouse
+  event ends a gesture interrupted by a key, fresh press, view switch, or resize.
+  Capture prevents a signal drag from selecting text or activating workbench
+  controls when the pointer leaves the view. Views that do not opt in keep
+  their existing routing.
+  Consecutive captured drags with the same modifiers and inside/outside state
+  coalesce to the latest position. Presses, releases, keys, wheel input, and
+  view changes remain ordering barriers. Cancel events have zero width/height
+  so they cannot overwrite a newer resize.
+- Scroll: `direction` (-1 up/left, 1 down/right), `axis` (`vertical` or
+  `horizontal`), `control`, `shift`, `alt`, coordinates and viewport size. `ctrl`
+  remains an alias for `control` for compatibility with existing extensions.
 - Resize: `kind: "resize"`, `width`, `height`.
 - Workbench document actions: `code: "documentChanged"`; re-read document info
   and render the resulting state.
+- Last tab closed: register `editor::register_close_handler`; `code: "closed"`
+  is sent to that handler after the final
+  copy of a view closes across editor groups. Save guest session settings and
+  release parsed data here; the same view ID may be opened again later.
+
+Tab, explorer-file, and docked-terminal drags remain workbench gestures,
+including their release over a rich view. These drops create splits or transfer
+tabs without invoking the view's mouse handler.
 
 Input callbacks run on workers. Keystrokes preserve order while a callback is
-busy; consecutive pending resize events are coalesced. Keep callbacks bounded:
-the host supplies 10 million Wasm fuel units per call and limits guest memory
+busy; pending resize events and consecutive hover events are coalesced. Hover
+coalescing never crosses a key, click, drag, scroll, or view-change boundary.
+An outstanding resize is delivered once per viewport size until the view is
+reopened; repainting an older or size-limited frame does not enqueue it again.
+Input and due tasks share
+the runtime fairly. Worker completion wakes the workbench; callbacks that only
+queue work or advance an internal decoder do not redraw an unchanged surface.
+Keep callbacks bounded:
+the host supplies 10 million Wasm fuel units per UI call and limits guest memory
 to 128 MiB. Frames are limited to 2 MiB, 512 lines, and 32768 total spans.
+
+Frames can opt into additional shortcuts with `keyCapture`, for example
+`["Ctrl+L", "Ctrl+Enter", "Ctrl+Shift+C", "Alt+1"]`. The host checks up to 32
+single-stroke shortcuts using the workbench shortcut syntax. These reach the
+view before built-in editor defaults. Explicit configured workbench bindings
+keep their priority, and F1, Ctrl+P/W/Tab and Ctrl+Shift+S remain reserved.
+The field is optional; older hosts ignore it.
+
+`vtcode_deactivate` receives the background task fuel budget so small persistent
+tools can flush their last accepted state on reload/unload. Reload/unload waits
+for views with staged input (`set_input_pending`) to settle first.
 Clipboard reads are supplied for paste events, and writes return through the
 UI thread. The guest has no WASI filesystem, process, or network capabilities.
 
 For incremental work, call `editor::register_task_handler(export, interval_ms)`.
 These handlers continue while the terminal is idle or unfocused, unlike
-cosmetic tick handlers. A positive interval is clamped to at least 10 ms; zero
+cosmetic tick handlers. Registered background task exports receive 250 million
+fuel units per call for bounded decoding/indexing; ordinary callbacks and
+cosmetic ticks retain the 10 million limit. A positive interval is clamped to at least 10 ms; zero
 unregisters it. Unregister promptly when work finishes or is cancelled. Task
-handlers run only while an extension's view is open (or it has no views).
+handlers continue until unregistered, including after the last view closes, so
+extensions can finish cleanup. Cosmetic tick handlers still require an open
+view (or an extension without views).
+Task exports return `0` (or have no return value) on success. Input handlers may
+also return `1` to indicate that they handled an event; tasks must use `0`.
+
+Check `editor::task_should_yield()` between small units of incremental work.
+It returns true after a 6 ms work slice or when fewer than 20 million fuel
+units remain, and always returns true outside a registered background task.
+Return normally, preserving progress for the next callback. This is cooperative:
+the host still enforces the hard fuel limit, and each unit of work must be
+bounded. The clock and fuel checks are host-owned; guests need no WASI clock.
 
 [Hex Editor](https://github.com/im-henri/vtcode-ext-hex-editor) is a complete working
 example with native behavior tests. VTCode keeps real-Wasm workbench integration

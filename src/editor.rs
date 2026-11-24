@@ -11,6 +11,10 @@ pub trait Backend {
     fn action(&mut self, id: u32, action: u32) -> Result<bool, String>;
     fn clipboard(&mut self) -> Result<String, String>;
     fn copy(&mut self, text: &str) -> Result<(), String>;
+    /// True when a long search should return and continue on the next task call.
+    fn should_yield(&mut self) -> bool {
+        true
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -38,6 +42,8 @@ pub struct Event {
     pub view_row: u16,
     #[serde(default)]
     pub direction: i32,
+    #[serde(default)]
+    pub click_count: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +64,14 @@ pub enum Prompt {
     },
 }
 
+/// A clickable region of the last frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    Command(&'static str),
+    Field(usize),
+    Scrollbar,
+}
+
 pub struct HexEditor {
     pub document: u32,
     pub cursor: u64,
@@ -74,24 +88,55 @@ pub struct HexEditor {
     pub status: String,
     pub error: bool,
     pub dragging: bool,
+    drag_origin: u64,
     pub reveal_cursor: bool,
-    pub toolbar: Vec<(usize, usize, &'static str)>,
+    /// Clickable regions of the last frame: row, first column, end column.
+    pub hits: Vec<(u16, u16, u16, Hit)>,
     pub search: Option<crate::search::SearchTask>,
     pub last_find: Option<(String, bool)>,
     pub prompt_cursor: usize,
     pub prompt_anchor: Option<usize>,
+    /// Pointer position while it is over the view.
+    pub hover: Option<(u16, u16)>,
+    /// Row within the thumb where a scrollbar drag grabbed it.
+    pub scroll_grab: Option<u64>,
+    /// Document size seen by the last event or frame.
+    pub size: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub bpr: usize,
     pub offset_width: usize,
+    pub offset_start: usize,
     pub hex_start: usize,
     pub ascii_start: usize,
+    /// First row of byte data; the column header is the row above it.
     pub data_start: usize,
     pub rows: usize,
+    /// Column of the scrollbar, right of the decoded text.
+    pub scrollbar: usize,
     pub inspector_start: Option<usize>,
     pub inspector_top: Option<usize>,
+}
+
+impl Layout {
+    pub fn hex_x(&self, column: usize) -> usize {
+        self.hex_start + column * 3 + column / 8
+    }
+    pub fn hex_end(&self) -> usize {
+        self.hex_x(self.bpr - 1) + 2
+    }
+}
+
+pub const INSPECTOR_WIDTH: usize = 34;
+
+pub fn prompt_rows(prompt: &Option<Prompt>) -> usize {
+    match prompt {
+        None => 0,
+        Some(Prompt::Find { replace: true, .. }) => 2,
+        Some(_) => 1,
+    }
 }
 
 impl HexEditor {
@@ -112,49 +157,92 @@ impl HexEditor {
             status: String::new(),
             error: false,
             dragging: false,
+            drag_origin: 0,
             reveal_cursor: true,
-            toolbar: Vec::new(),
+            hits: Vec::new(),
             search: None,
             last_find: None,
             prompt_cursor: 0,
             prompt_anchor: None,
+            hover: None,
+            scroll_grab: None,
+            size: 0,
         }
     }
 
     pub fn layout(&self, size: u64) -> Layout {
         let width = self.width as usize;
+        let height = self.height as usize;
         let offset_width = if size > u32::MAX as u64 { 16 } else { 8 };
-        let inspector_start = (self.inspector && width >= 114).then_some(width.saturating_sub(32));
-        let inspector_top =
-            (self.inspector && inspector_start.is_none() && width >= 40 && self.height >= 18)
-                .then_some((self.height as usize).saturating_sub(9));
+        // Left pad, offset, gap, bytes, gap, text, gap, scrollbar.
+        let grid = |n: usize| 1 + offset_width + 2 + n * 3 + (n - 1) / 8 - 1 + 3 + n + 2;
+        let side = self.inspector && width >= grid(16) + INSPECTOR_WIDTH;
+        let inspector_start = side.then(|| width - INSPECTOR_WIDTH);
         let available = inspector_start.unwrap_or(width);
         let bpr = [16, 8, 4, 1]
             .into_iter()
-            .find(|n| offset_width + 5 + n * 4 + (n - 1) / 8 <= available)
+            .find(|n| grid(*n) <= available)
             .unwrap_or(1);
-        let hex_start = offset_width + 2;
-        let ascii_start = hex_start + bpr * 3 + (bpr - 1) / 8 + 2;
-        let data_start = 2
-            + usize::from(self.prompt.is_some())
-            + usize::from(matches!(
-                self.prompt,
-                Some(Prompt::Find { replace: true, .. })
-            ));
-        let rows = inspector_top
-            .unwrap_or(self.height as usize - usize::from(self.height > 0))
-            .saturating_sub(data_start)
-            .max(1);
+        let offset_start = 1;
+        let hex_start = offset_start + offset_width + 2;
+        let hex_end = hex_start + bpr * 3 + (bpr - 1) / 8 - 1;
+        let ascii_start = hex_end + 3;
+        let data_start = 2 + prompt_rows(&self.prompt);
+        let inspector_top = (self.inspector && !side && width >= 40 && height >= 20)
+            .then(|| height.saturating_sub(8));
+        let bottom = inspector_top.unwrap_or(height.saturating_sub(1));
+        let rows = bottom.saturating_sub(data_start).max(1);
         Layout {
             bpr,
             offset_width,
+            offset_start,
             hex_start,
             ascii_start,
             data_start,
             rows,
+            scrollbar: available.saturating_sub(1),
             inspector_start,
             inspector_top,
         }
+    }
+
+    /// Rows in the document, including the empty row that accepts appends.
+    pub fn total_rows(size: u64, layout: &Layout) -> u64 {
+        size / layout.bpr as u64 + 1
+    }
+
+    pub fn max_top(size: u64, layout: &Layout) -> u64 {
+        Self::total_rows(size, layout).saturating_sub(layout.rows as u64) * layout.bpr as u64
+    }
+
+    /// Scrollbar thumb as (first row, height) within the track, if the
+    /// document needs one.
+    pub fn thumb(&self, size: u64, layout: &Layout) -> Option<(usize, usize)> {
+        let total = Self::total_rows(size, layout) as u128;
+        let track = layout.rows as u128;
+        if total <= track {
+            return None;
+        }
+        let height = (track * track / total).clamp(1, track);
+        let max_row = total - track;
+        let top_row = (self.top / layout.bpr as u64) as u128;
+        let y = top_row.min(max_row) * (track - height) / max_row;
+        Some((y as usize, height as usize))
+    }
+
+    fn scroll_to_thumb(&mut self, size: u64, layout: &Layout, thumb_y: i64) {
+        let Some((_, height)) = self.thumb(size, layout) else {
+            return;
+        };
+        let room = (layout.rows - height) as i128;
+        let total = Self::total_rows(size, layout) as i128;
+        let max_row = total - layout.rows as i128;
+        let row = if room <= 0 {
+            0
+        } else {
+            (thumb_y as i128).clamp(0, room) * max_row / room
+        };
+        self.top = row as u64 * layout.bpr as u64;
     }
 
     pub fn selection(&self, size: u64) -> (u64, u64) {
@@ -180,9 +268,58 @@ impl HexEditor {
         self.low_nibble = false;
     }
 
+    pub fn hit_at(&self, x: u16, y: u16) -> Option<Hit> {
+        self.hits
+            .iter()
+            .find(|(row, start, end, _)| *row == y && x >= *start && x < *end)
+            .map(|hit| hit.3)
+    }
+
+    /// Byte under a grid position, and which pane it is in.
+    pub fn byte_at(&self, layout: &Layout, x: usize, y: usize) -> Option<(u64, Pane)> {
+        if y < layout.data_start || y >= layout.data_start + layout.rows {
+            return None;
+        }
+        let (column, pane) = if x >= layout.ascii_start && x < layout.ascii_start + layout.bpr {
+            (x - layout.ascii_start, Pane::Text)
+        } else if x + 1 >= layout.hex_start && x <= layout.hex_end() {
+            let column = (0..layout.bpr)
+                .min_by_key(|column| (layout.hex_x(*column) * 2 + 1).abs_diff(x * 2))
+                .unwrap_or(0);
+            (column, Pane::Hex)
+        } else {
+            return None;
+        };
+        Some((
+            self.top + ((y - layout.data_start) * layout.bpr + column) as u64,
+            pane,
+        ))
+    }
+
+    /// What the pointer is over, for deciding whether a hover changes the frame.
+    pub fn hover_key(&self) -> (Option<Hit>, Option<u64>) {
+        let Some((x, y)) = self.hover else {
+            return (None, None);
+        };
+        let layout = self.layout(self.size);
+        (
+            self.hit_at(x, y),
+            self.byte_at(&layout, x as usize, y as usize)
+                .map(|(offset, _)| offset)
+                .filter(|offset| *offset < self.size),
+        )
+    }
+
     pub fn event(&mut self, event: Event, backend: &mut impl Backend) {
+        if matches!(event.kind.as_str(), "move" | "leave") {
+            self.hover = (event.kind == "move").then_some((event.view_column, event.view_row));
+            return;
+        }
         self.error = false;
-        self.reveal_cursor = event.direction == 0 && event.kind != "resize";
+        self.reveal_cursor = event.direction == 0
+            && !matches!(event.kind.as_str(), "resize" | "drag" | "up" | "cancel")
+            && !(event.kind == "down"
+                && self.hit_at(event.view_column, event.view_row) == Some(Hit::Scrollbar));
         if event.width > 0 {
             self.width = event.width;
         }
@@ -198,31 +335,37 @@ impl HexEditor {
 
     fn handle(&mut self, event: Event, backend: &mut impl Backend) -> Result<(), String> {
         let info = backend.info(self.document)?;
+        self.size = info.size;
         let layout = self.layout(info.size);
         self.cursor = self.cursor.min(info.size);
-        if event.kind == "resize" {
+        if event.kind == "resize" || event.code == "documentChanged" {
             return Ok(());
         }
         if self.search.is_some() && event.code == "escape" {
             self.cancel_search(backend)?;
-            self.status = "Operation cancelled".into();
+            self.status = "Search cancelled".into();
             return Ok(());
         }
         if self.search.is_some() && !matches!(event.code.as_str(), "" | "other") {
             self.cancel_search(backend)?;
         }
         if event.direction != 0 {
-            let step = (layout.bpr * 3) as u64;
+            let rows = if event.shift || event.control {
+                layout.rows.saturating_sub(1).max(1)
+            } else {
+                3
+            };
+            let step = (layout.bpr * rows) as u64;
             self.top = if event.direction < 0 {
                 self.top.saturating_sub(step)
             } else {
                 self.top
                     .saturating_add(step)
-                    .min(info.size / layout.bpr as u64 * layout.bpr as u64)
+                    .min(Self::max_top(info.size, &layout))
             };
             return Ok(());
         }
-        if matches!(event.kind.as_str(), "down" | "up" | "drag") {
+        if matches!(event.kind.as_str(), "down" | "up" | "drag" | "cancel") {
             return self.pointer(event, &info, layout, backend);
         }
         if event.code == "command"
@@ -241,9 +384,6 @@ impl HexEditor {
                 event.text.into_bytes()
             };
             return self.paste_bytes(&bytes, backend, &info);
-        }
-        if event.code == "command" {
-            return self.command(&event.text, backend, &info);
         }
         if event.control {
             if matches!(event.code.as_str(), "home" | "end") {
@@ -278,38 +418,36 @@ impl HexEditor {
             }
             return Ok(());
         }
+        let bpr = layout.bpr as u64;
+        let page = (layout.bpr * layout.rows.saturating_sub(1).max(1)) as u64;
         match event.code.as_str() {
             "left" => self.move_to(self.cursor.saturating_sub(1), event.shift, info.size),
             "right" => self.move_to(self.cursor.saturating_add(1), event.shift, info.size),
-            "up" => self.move_to(
-                self.cursor.saturating_sub(layout.bpr as u64),
-                event.shift,
-                info.size,
-            ),
-            "down" => self.move_to(
-                self.cursor.saturating_add(layout.bpr as u64),
-                event.shift,
-                info.size,
-            ),
-            "pageUp" => self.move_to(
-                self.cursor
-                    .saturating_sub((layout.bpr * layout.rows) as u64),
-                event.shift,
-                info.size,
-            ),
-            "pageDown" => self.move_to(
-                self.cursor
-                    .saturating_add((layout.bpr * layout.rows) as u64),
-                event.shift,
-                info.size,
-            ),
-            "home" => self.move_to(
-                self.cursor / layout.bpr as u64 * layout.bpr as u64,
-                event.shift,
-                info.size,
-            ),
+            "up" => self.move_to(self.cursor.saturating_sub(bpr), event.shift, info.size),
+            "down" => self.move_to(self.cursor.saturating_add(bpr), event.shift, info.size),
+            "pageUp" | "pageDown" => {
+                let up = event.code == "pageUp";
+                self.move_to(
+                    if up {
+                        self.cursor.saturating_sub(page)
+                    } else {
+                        self.cursor.saturating_add(page)
+                    },
+                    event.shift,
+                    info.size,
+                );
+                // Keep the cursor on the same screen row, like a text editor.
+                self.top = if up {
+                    self.top.saturating_sub(page)
+                } else {
+                    self.top
+                        .saturating_add(page)
+                        .min(Self::max_top(info.size, &layout))
+                };
+            }
+            "home" => self.move_to(self.cursor / bpr * bpr, event.shift, info.size),
             "end" => self.move_to(
-                (self.cursor / layout.bpr as u64 + 1) * layout.bpr as u64,
+                (self.cursor / bpr * bpr + bpr - 1).min(info.size),
                 event.shift,
                 info.size,
             ),
@@ -335,6 +473,9 @@ impl HexEditor {
                     }
                     start = self.cursor - 1;
                     delete = 1;
+                }
+                if delete == 0 {
+                    return Ok(());
                 }
                 backend.edit(self.document, start, delete, &[])?;
                 self.move_to(start, false, info.size - delete);
@@ -384,7 +525,7 @@ impl HexEditor {
         Ok(())
     }
 
-    fn command(
+    pub(crate) fn command(
         &mut self,
         command: &str,
         backend: &mut impl Backend,
@@ -406,10 +547,13 @@ impl HexEditor {
                 self.cursor = info.size;
             }
             "find" | "find_replace" => {
-                let (query, hex) = self
-                    .last_find
-                    .clone()
-                    .unwrap_or((String::new(), self.pane == Pane::Hex));
+                let (query, hex) = match &self.prompt {
+                    Some(Prompt::Find { query, hex, .. }) => (query.clone(), *hex),
+                    _ => self
+                        .last_find
+                        .clone()
+                        .unwrap_or((String::new(), self.pane == Pane::Hex)),
+                };
                 self.prompt_cursor = query.len();
                 self.prompt_anchor = (!query.is_empty()).then_some(0);
                 self.prompt = Some(Prompt::Find {
@@ -419,6 +563,17 @@ impl HexEditor {
                     replace: command == "find_replace",
                     field: 0,
                 });
+            }
+            "toggle_replace" => {
+                if let Some(Prompt::Find { replace, field, .. }) = &mut self.prompt {
+                    *replace = !*replace;
+                    *field = 0;
+                }
+            }
+            "find_mode_text" | "find_mode_hex" => {
+                if let Some(Prompt::Find { hex, .. }) = &mut self.prompt {
+                    *hex = command == "find_mode_hex";
+                }
             }
             "find_next" | "find_prev" => {
                 if self.prompt.is_none() {
@@ -442,6 +597,33 @@ impl HexEditor {
                     backend,
                     info,
                 )?;
+            }
+            "replace_one" | "replace_all" => {
+                self.prompt_key(
+                    Event {
+                        code: "enter".into(),
+                        control: true,
+                        shift: command == "replace_all",
+                        ..Default::default()
+                    },
+                    backend,
+                    info,
+                )?;
+            }
+            "goto_submit" => {
+                self.prompt_key(
+                    Event {
+                        code: "enter".into(),
+                        ..Default::default()
+                    },
+                    backend,
+                    info,
+                )?;
+            }
+            "close_prompt" => {
+                self.cancel_search(backend)?;
+                self.prompt = None;
+                self.status.clear();
             }
             "goto_line" => {
                 self.prompt_cursor = 0;
@@ -477,7 +659,9 @@ impl HexEditor {
             }
             "inspector" => self.inspector = !self.inspector,
             "endian" => self.little_endian = !self.little_endian,
+            "little_endian" | "big_endian" => self.little_endian = command == "little_endian",
             "mode" => self.insert = !self.insert,
+            "insert_mode" | "overwrite_mode" => self.insert = command == "insert_mode",
             _ => {}
         }
         Ok(())
@@ -513,53 +697,152 @@ impl HexEditor {
         layout: Layout,
         backend: &mut impl Backend,
     ) -> Result<(), String> {
-        if event.kind == "up" {
-            self.dragging = false;
-            return Ok(());
-        }
         let x = event.view_column as usize;
         let y = event.view_row as usize;
-        if event.kind == "down"
-            && y == 0
-            && let Some((_, _, command)) = self
-                .toolbar
-                .iter()
-                .find(|(start, end, _)| x >= *start && x < *end)
-        {
-            return self.command(command, backend, info);
-        }
-        if y < layout.data_start || y >= layout.data_start + layout.rows {
+        if matches!(event.kind.as_str(), "up" | "cancel") {
+            self.dragging = false;
+            self.scroll_grab = None;
             return Ok(());
         }
-        let column = if x >= layout.ascii_start && x < layout.ascii_start + layout.bpr {
-            self.pane = Pane::Text;
-            x - layout.ascii_start
-        } else if x >= layout.hex_start && x < layout.ascii_start - 2 {
-            self.pane = Pane::Hex;
-            (0..layout.bpr)
-                .min_by_key(|index| (layout.hex_start + index * 3 + index / 8).abs_diff(x))
-                .unwrap_or(0)
+        if let Some(grab) = self.scroll_grab {
+            let row = y as i64 - layout.data_start as i64 - grab as i64;
+            self.scroll_to_thumb(info.size, &layout, row);
+            return Ok(());
+        }
+        if event.kind == "down" {
+            match self.hit_at(event.view_column, event.view_row) {
+                Some(Hit::Command(command)) => return self.command(command, backend, info),
+                Some(Hit::Field(field)) => {
+                    self.focus_field(field, x);
+                    return Ok(());
+                }
+                Some(Hit::Scrollbar) => {
+                    if let Some((thumb, height)) = self.thumb(info.size, &layout) {
+                        let row = y.saturating_sub(layout.data_start);
+                        // Grabbing the thumb keeps its offset; the track jumps there.
+                        let grab = if row >= thumb && row < thumb + height {
+                            row - thumb
+                        } else {
+                            height / 2
+                        };
+                        self.scroll_grab = Some(grab as u64);
+                        self.scroll_to_thumb(info.size, &layout, row as i64 - grab as i64);
+                    }
+                    return Ok(());
+                }
+                None => {}
+            }
+        }
+        if event.kind == "drag" && !self.dragging {
+            return Ok(());
+        }
+        // Dragging past the grid scrolls and keeps extending the selection.
+        let last = layout.data_start + layout.rows - 1;
+        let bpr = layout.bpr as u64;
+        let mut row = y;
+        if self.dragging && y < layout.data_start {
+            self.top = self.top.saturating_sub(bpr);
+            row = layout.data_start;
+        } else if self.dragging && y > last {
+            self.top = self
+                .top
+                .saturating_add(bpr)
+                .min(Self::max_top(info.size, &layout));
+            row = last;
+        }
+        let x = if self.dragging {
+            let (lo, hi) = if self.pane == Pane::Hex {
+                (layout.hex_start, layout.hex_end())
+            } else {
+                (layout.ascii_start, layout.ascii_start + layout.bpr - 1)
+            };
+            x.clamp(lo, hi)
         } else {
+            x
+        };
+        let Some((offset, pane)) = self.byte_at(&layout, x, row) else {
             return Ok(());
         };
-        let offset = self.top + ((y - layout.data_start) * layout.bpr + column) as u64;
+        let offset = offset.min(info.size);
         if event.kind == "down" {
-            self.move_to(offset, event.shift, info.size);
+            self.pane = pane;
+            if event.click_count >= 2 && !event.shift {
+                // Double click selects the whole row.
+                let start = offset / bpr * bpr;
+                self.anchor = Some(start.min(info.size));
+                self.cursor = (start + bpr).min(info.size);
+                self.low_nibble = false;
+                return Ok(());
+            }
+            self.low_nibble = false;
             self.dragging = true;
-        } else if self.dragging {
-            self.anchor.get_or_insert(self.cursor);
-            self.cursor = offset.saturating_add(1).min(info.size);
+            if !event.shift {
+                self.move_to(offset, false, info.size);
+                self.drag_origin = offset;
+                return Ok(());
+            }
+            // Shift+click extends from the selection start like a drag does.
+            self.drag_origin = match self.anchor {
+                Some(anchor) if anchor > self.cursor => anchor - 1,
+                Some(anchor) => anchor,
+                None => self.cursor,
+            };
+        }
+        if self.dragging {
+            // Both the byte where the drag began and the one under the pointer
+            // stay selected, whichever direction the drag goes.
+            let origin = self.drag_origin;
+            if offset >= origin {
+                self.anchor = Some(origin);
+                self.cursor = offset.saturating_add(1).min(info.size);
+            } else {
+                self.anchor = Some(origin.saturating_add(1).min(info.size));
+                self.cursor = offset;
+            }
         }
         Ok(())
     }
+
+    fn focus_field(&mut self, field: usize, x: usize) {
+        let start = self
+            .hits
+            .iter()
+            .find(|hit| hit.3 == Hit::Field(field))
+            .map_or(0, |hit| hit.1 as usize + 1);
+        let text = match &mut self.prompt {
+            Some(Prompt::Find {
+                query,
+                replacement,
+                field: active,
+                ..
+            }) => {
+                *active = field;
+                if field == 0 { query } else { replacement }
+            }
+            Some(Prompt::Goto(input)) => input,
+            None => return,
+        };
+        let column = x.saturating_sub(start);
+        self.prompt_cursor = text
+            .char_indices()
+            .nth(column)
+            .map_or(text.len(), |(index, _)| index);
+        self.prompt_anchor = None;
+    }
 }
 
+pub const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
 pub fn hex_text(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut text = String::with_capacity(bytes.len() * 3);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 15) as usize] as char);
+    }
+    text
 }
 
 pub fn parse_hex(text: &str) -> Result<Vec<u8>, String> {

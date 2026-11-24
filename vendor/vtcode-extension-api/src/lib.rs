@@ -374,6 +374,16 @@ pub fn current_view_event() -> Option<String> {
     })
 }
 
+/// Read the current event only if its encoded JSON fits the caller's budget.
+#[cfg(target_arch = "wasm32")]
+pub fn current_view_event_limited(max_bytes: usize) -> Result<Option<String>, String> {
+    let len = unsafe { host_current_view_event_len() };
+    if len > 0 && len as usize > max_bytes {
+        return Err(format!("Encoded input exceeds the {} KiB event budget. Paste a smaller selection.", max_bytes / 1024));
+    }
+    Ok(read_host_string(len, |ptr, max_len| unsafe { host_read_current_view_event(ptr, max_len) }))
+}
+
 /// Register a floating overlay panel that renders on top of the editor.
 #[cfg(target_arch = "wasm32")]
 pub fn register_overlay(id: &str, title: &str, content: &str, x: u16, y: u16, width: u16, height: u16) {

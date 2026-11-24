@@ -1,0 +1,3 @@
+[target.wasm32-unknown-unknown]
+# memchr uses SIMD to scan for search matches.
+rustflags = ["-C", "target-feature=+simd128"]

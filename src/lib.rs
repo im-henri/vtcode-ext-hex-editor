@@ -30,10 +30,23 @@ mod guest {
             host::document_action(id, action)
         }
         fn clipboard(&mut self) -> Result<String, String> {
-            host::clipboard()
+            host::clipboard_limited(4 * 1024 * 1024)
         }
         fn copy(&mut self, text: &str) -> Result<(), String> {
             host::set_clipboard(text)
+        }
+        fn should_yield(&mut self) -> bool {
+            host::task_should_yield()
+        }
+    }
+
+    const TASK: &str = "hex_tick";
+
+    fn sync_task(editors: &HashMap<u32, HexEditor>) {
+        if editors.values().any(|editor| editor.search.is_some()) {
+            host::register_task_handler(TASK, 10);
+        } else {
+            host::register_task_handler(TASK, 0);
         }
     }
 
@@ -42,7 +55,6 @@ mod guest {
         api::register_command("hex.open", "Reopen File as Hex");
         api::register_explorer_context_command("hex.open", "Open With Hex Editor");
         api::register_binary_open_command("hex.open", "Hex Editor");
-        api::set_status("Ready");
         0
     }
 
@@ -65,11 +77,14 @@ mod guest {
                 .next()
                 .unwrap_or("Binary file");
             let view = format!("hex:{id}");
-            api::register_view(&view, &format!("{name} · Hex Editor"), "");
+            api::register_view(&view, &format!("{name} · Hex"), "");
             api::register_view_key_handler(&view, "hex_event");
             api::register_view_mouse_handler(&view, "hex_event");
             api::register_view_scroll_handler(&view, "hex_event");
             host::register_resize_handler(&view, "hex_event");
+            host::register_hover_handler(&view, "hex_event");
+            host::register_close_handler(&view, "hex_event");
+            host::enable_pointer_capture(&view, true);
             EDITORS.with(|editors| -> Result<(), String> {
                 let mut editors = editors.borrow_mut();
                 let editor = editors.entry(id).or_insert_with(|| HexEditor::new(id));
@@ -98,18 +113,28 @@ mod guest {
                 .ok_or("Invalid hex view")?
                 .parse::<u32>()
                 .map_err(|error| error.to_string())?;
-            let event: Event = serde_json::from_str(&json).map_err(|error| error.to_string())?;
+            let event: Event =
+                serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
             EDITORS.with(|editors| -> Result<(), String> {
                 let mut editors = editors.borrow_mut();
-                let editor = editors.get_mut(&id).ok_or("The hex editor has closed")?;
-                editor.event(event, &mut Host);
-                if editors.values().any(|editor| editor.search.is_some()) {
-                    host::register_task_handler("hex_tick", 16);
-                } else {
-                    api::unregister_tick_handler("hex_tick");
+                if event.code == "closed" {
+                    if let Some(mut editor) = editors.remove(&id) {
+                        let _ = editor.cancel_search(&mut Host);
+                    }
+                    sync_task(&editors);
+                    return Ok(());
                 }
                 let editor = editors.get_mut(&id).ok_or("The hex editor has closed")?;
-                host::set_frame(view, &editor.render(&mut Host)?)
+                let hover_only = matches!(event.kind.as_str(), "move" | "leave");
+                let before = editor.hover_key();
+                editor.event(event, &mut Host);
+                // Pointer motion repaints only when it changes what is highlighted.
+                if hover_only && editor.hover_key() == before {
+                    return Ok(());
+                }
+                let frame = editor.render(&mut Host)?;
+                sync_task(&editors);
+                host::set_frame(view, &frame)
             })
         })();
         if let Err(error) = result {
@@ -137,9 +162,7 @@ mod guest {
                     let _ = host::set_frame(&format!("hex:{id}"), &frame);
                 }
             }
-            if !editors.values().any(|editor| editor.search.is_some()) {
-                api::unregister_tick_handler("hex_tick");
-            }
+            sync_task(&editors);
         });
         0
     }
